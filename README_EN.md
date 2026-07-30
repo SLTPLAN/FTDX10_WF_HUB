@@ -6,7 +6,7 @@ This document defines the **data frame format** only. The transport layer can be
 
 Currently being implemented on STM32F103C8T6 and ESP32 via USB-CDC for use with a custom wfview build.
 
-Download the wfview support FTDX10:https://tylk.cc/file_download/wfview-release-with-DX10-hub.zip
+Download the wfview support FTDX10(Support USB-CDC):https://tylk.cc/file_download/wfview-release-with-DX10-hub.zip
 
 ---
 
