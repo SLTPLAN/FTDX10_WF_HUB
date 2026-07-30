@@ -43,6 +43,7 @@ static uint8_t spi_buffer[PACKET_SIZE];        // SPI 单缓冲 / single SPI buf
 static volatile uint16_t spi_rx_index = 0;     // 当前接收位置 / current RX index
 static volatile bool     packet_ready = false;  // 包就绪标志 / frame complete flag
 static volatile bool     spi_active   = false;  // SPI 正在接收 / SPI actively receiving
+static volatile bool     frame_start  = false;  // 新帧开始标志 / new frame start flag
 
 static uint32_t packet_count = 0;
 static uint32_t total_bytes  = 0;
@@ -54,8 +55,21 @@ static uint32_t total_bytes  = 0;
 extern "C" void SPI1_IRQHandler(void) {
   if (SPI1->SR & SPI_SR_RXNE) {
     uint8_t byte = *(volatile uint8_t *)&SPI1->DR;
+
+    // 新帧第一字节: 在此复位 spi_rx_index (延迟复位, 让 CS↓ 尽快返回)
+    // First byte of new frame: reset spi_rx_index here (deferred reset)
+    if (frame_start) {
+      spi_rx_index = 0;
+      frame_start  = false;
+    }
+
     if (spi_rx_index < PACKET_SIZE) {
       spi_buffer[spi_rx_index++] = byte;
+      if (spi_rx_index >= PACKET_SIZE) {
+        SPI1->CR2 &= ~SPI_CR2_RXNEIE;
+        spi_active = false;
+        packet_ready = true;
+      }
     }
   }
 
@@ -67,29 +81,31 @@ extern "C" void SPI1_IRQHandler(void) {
 }
 
 // ============================================================
-//  CS 引脚中断 — 使用 Arduino attachInterrupt
-//  CS Pin ISR — via Arduino attachInterrupt
+//  CS 引脚中断 — 硬件 NSS + 帧开始/结束标记
+//  CS Pin ISR — HW NSS + frame start/end markers
 // ============================================================
 static void cs_interrupt_handler(void) {
-  bool cs_low = !digitalRead(PIN_SPI_CS);
+  bool cs_low = !(GPIOA->IDR & (1 << 4));
 
   if (cs_low) {
-    // CS ↓ — SPI 开始发送数据 / radio starts a frame
-    spi_rx_index = 0;
+    // CS ↓ — 硬件 NSS 已自动选中, 只需使能 RXNEIE
+    // 极简路径: spi_rx_index 在 SPI1 ISR 首字节时复位
+    // HW NSS already selected; just enable RXNEIE
     spi_active   = true;
-
-    // 清空残留字节 & 溢出标志 / flush stale bytes & clear overrun
-    while (SPI1->SR & SPI_SR_RXNE) (void)SPI1->DR;
-    if (SPI1->SR & SPI_SR_OVR) { (void)SPI1->DR; (void)SPI1->SR; }
-
-    // 开 RXNE 中断 / enable RXNE interrupt
+    frame_start  = true;
     SPI1->CR2 |= SPI_CR2_RXNEIE;
 
   } else if (spi_active) {
-    // CS ↑ — 数据接收完毕 / frame complete
-    spi_active = false;
-    SPI1->CR2 &= ~SPI_CR2_RXNEIE;   // 关中断 / disable RXNE interrupt
-    packet_ready = (spi_rx_index > 0);
+    // CS ↑ — 帧结束 / frame end
+    if (spi_rx_index < PACKET_SIZE && (SPI1->SR & SPI_SR_RXNE))
+      spi_buffer[spi_rx_index++] = *(volatile uint8_t *)&SPI1->DR;
+    if (SPI1->SR & SPI_SR_OVR) { (void)SPI1->DR; (void)SPI1->SR; }
+
+    SPI1->CR2 &= ~SPI_CR2_RXNEIE;
+
+    frame_start  = false;
+    spi_active   = false;
+    packet_ready = true;
   }
 }
 
@@ -101,7 +117,7 @@ static void spi_slave_init(void) {
   // ---- 使能时钟 / Enable clocks ----
   RCC->APB2ENR |= RCC_APB2ENR_SPI1EN | RCC_APB2ENR_IOPAEN | RCC_APB2ENR_AFIOEN;
 
-  // ---- PA4(CS) - 浮空输入 / floating input ----
+  // ---- PA4(CS) - 浮空输入 (硬件 NSS) / floating input (HW NSS) ----
   GPIOA->CRL &= ~(0xF << (4 * 4));
   GPIOA->CRL |=  (0x4 << (4 * 4));
 
@@ -109,16 +125,21 @@ static void spi_slave_init(void) {
   GPIOA->CRL &= ~(0xF << (5 * 4));
   GPIOA->CRL |=  (0x4 << (5 * 4));
 
+  // ---- PA6(MISO) - 复用推挽输出 50MHz / AF PP 50MHz ----
+  GPIOA->CRL &= ~(0xF << (6 * 4));
+  GPIOA->CRL |=  (0xB << (6 * 4));
+
   // ---- PA7(MOSI) - 浮空输入 / floating input ----
   GPIOA->CRL &= ~(0xF << (7 * 4));
   GPIOA->CRL |=  (0x4 << (7 * 4));
 
   // ---- SPI1: 从机, 模式1, 硬件 NSS / slave, mode1, hardware NSS ----
+  //  硬件 NSS 零延迟选中, spi_rx_index 在 SPI1 ISR 首字节时复位
   SPI1->CR1 = 0;
-  SPI1->CR1 = SPI_CR1_CPHA;           // 模式1, MSTR=0(从机), SSM=0(硬件NSS) / mode1, slave, hw NSS
-  SPI1->CR1 &= ~SPI_CR1_LSBFIRST;     // MSB 先行 / MSB first
-  SPI1->CR2 = 0;                      // RXNEIE 由 CS 中断控制 / managed by CS ISR
-  SPI1->CR1 |= SPI_CR1_SPE;           // 使能 SPI / enable SPI
+  SPI1->CR1 = SPI_CR1_CPHA;           // 模式1, MSTR=0(从机), SSM=0(硬件NSS)
+  SPI1->CR1 &= ~SPI_CR1_LSBFIRST;     // MSB 先行
+  SPI1->CR2 = 0;                      // RXNEIE 由 CS 中断控制
+  SPI1->CR1 |= SPI_CR1_SPE;           // 使能 SPI
 
   // ---- NVIC ----
   //  USB LP 默认优先级 0 > EXTI4(1), 会延迟 CS 中断导致丢前几个字节
@@ -150,13 +171,14 @@ static void send_frame(const uint8_t *data, size_t len) {
   SerialUSB.write(len & 0xFF);
   SerialUSB.write(xor_sum);
 
-  // 分块发送, 避免长时间阻塞 / send in chunks to avoid long blocking
+  // 分块发送, 避免长时间阻塞; 用实际写入量重试 / chunked send, retry on partial write
   size_t offset = 0;
   while (offset < len) {
     size_t chunk = len - offset;
     if (chunk > 64) chunk = 64;
-    SerialUSB.write(data + offset, chunk);
-    offset += chunk;
+    size_t written = SerialUSB.write(data + offset, chunk);
+    if (written == 0) break;  // USB 断开则放弃 / give up if USB disconnected
+    offset += written;
   }
 }
 
@@ -238,6 +260,10 @@ void loop(void) {
                         packet_count, rx_len, total_bytes / 1024);
           last_summary = now;
         }
+      } else {
+        // 打印非标准帧, 调试用 / print non-standard frame for debug
+        SerialUSB.printf("[SPI] !!! #%u | %u B (非标准)\n",
+                        packet_count, rx_len);
       }
     }
   }
