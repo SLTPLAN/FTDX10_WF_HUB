@@ -43,37 +43,15 @@ static uint8_t spi_buffer[PACKET_SIZE];        // SPI 单缓冲 / single SPI buf
 static volatile uint16_t spi_rx_index = 0;     // 当前接收位置 / current RX index
 static volatile bool     packet_ready = false;  // 包就绪标志 / frame complete flag
 static volatile bool     spi_active   = false;  // SPI 正在接收 / SPI actively receiving
-static volatile bool     frame_start  = false;  // 新帧开始标志 / new frame start flag
 
 static uint32_t packet_count = 0;
 static uint32_t total_bytes  = 0;
 
 // ============================================================
-//  SPI1 中断 — RXNE (每收到一个字节)
-//  SPI1 ISR — RXNE (one byte per interrupt)
+//  SPI1 中断 — 安全网 (DMA 为主, 仅在溢出时触发)
+//  SPI1 ISR — safety net (DMA primary, fires on overrun only)
 // ============================================================
 extern "C" void SPI1_IRQHandler(void) {
-  if (SPI1->SR & SPI_SR_RXNE) {
-    uint8_t byte = *(volatile uint8_t *)&SPI1->DR;
-
-    // 新帧第一字节: 在此复位 spi_rx_index (延迟复位, 让 CS↓ 尽快返回)
-    // First byte of new frame: reset spi_rx_index here (deferred reset)
-    if (frame_start) {
-      spi_rx_index = 0;
-      frame_start  = false;
-    }
-
-    if (spi_rx_index < PACKET_SIZE) {
-      spi_buffer[spi_rx_index++] = byte;
-      if (spi_rx_index >= PACKET_SIZE) {
-        SPI1->CR2 &= ~SPI_CR2_RXNEIE;
-        spi_active = false;
-        packet_ready = true;
-      }
-    }
-  }
-
-  // 清除溢出 / clear overrun flag
   if (SPI1->SR & SPI_SR_OVR) {
     (void)SPI1->DR;
     (void)SPI1->SR;
@@ -81,31 +59,35 @@ extern "C" void SPI1_IRQHandler(void) {
 }
 
 // ============================================================
-//  CS 引脚中断 — 硬件 NSS + 帧开始/结束标记
-//  CS Pin ISR — HW NSS + frame start/end markers
+//  CS 引脚中断 — 硬件 NSS + DMA 帧控制 (完整复位序列)
+//  CS Pin ISR — HW NSS + DMA frame control (full reset sequence)
 // ============================================================
 static void cs_interrupt_handler(void) {
-  bool cs_low = !(GPIOA->IDR & (1 << 4));
+  if (!(GPIOA->IDR & (1 << 4))) {        // CS ↓ — 帧开始
+    // ============ 极简路径: 缩小竞争窗口 ============
+    // Fast path: minimize window between CS↓ and DMA enable
+    DMA1->IFCR = DMA_IFCR_CTCIF2        // 清除所有标志 / clear all flags for CH2
+               | DMA_IFCR_CTEIF2
+               | DMA_IFCR_CGIF2;
+    DMA1_Channel2->CCR = 0;              // 关断 / disable
+    DMA1_Channel2->CNDTR = PACKET_SIZE;  // 设计数 / set transfer count
+    DMA1_Channel2->CCR = DMA_CCR_MINC    // 内存递增 / mem inc
+                       | DMA_CCR_PSIZE_0 // 16位匹配 SPI DR / 16-bit width
+                       | DMA_CCR_EN;     // 使能 / enable
+    spi_active = true;
 
-  if (cs_low) {
-    // CS ↓ — 硬件 NSS 已自动选中, 只需使能 RXNEIE
-    // 极简路径: spi_rx_index 在 SPI1 ISR 首字节时复位
-    // HW NSS already selected; just enable RXNEIE
-    spi_active   = true;
-    frame_start  = true;
-    SPI1->CR2 |= SPI_CR2_RXNEIE;
+  } else if (spi_active) {               // CS ↑ — 帧结束
+    // ============ 精准停止, 读取计数 ============
+    DMA1_Channel2->CCR = 0;              // 发起停止 / request stop
+    while (DMA1_Channel2->CCR & DMA_CCR_EN); // 等待真正停稳 / wait for confirmed stop
 
-  } else if (spi_active) {
-    // CS ↑ — 帧结束 / frame end
-    if (spi_rx_index < PACKET_SIZE && (SPI1->SR & SPI_SR_RXNE))
-      spi_buffer[spi_rx_index++] = *(volatile uint8_t *)&SPI1->DR;
-    if (SPI1->SR & SPI_SR_OVR) { (void)SPI1->DR; (void)SPI1->SR; }
-
-    SPI1->CR2 &= ~SPI_CR2_RXNEIE;
-
-    frame_start  = false;
-    spi_active   = false;
-    packet_ready = true;
+    uint16_t remaining = DMA1_Channel2->CNDTR;
+    uint16_t received = PACKET_SIZE - remaining;
+    if (received > 0) {
+      spi_rx_index = received;
+      packet_ready = true;
+    }
+    spi_active = false;
   }
 }
 
@@ -116,6 +98,7 @@ static void cs_interrupt_handler(void) {
 static void spi_slave_init(void) {
   // ---- 使能时钟 / Enable clocks ----
   RCC->APB2ENR |= RCC_APB2ENR_SPI1EN | RCC_APB2ENR_IOPAEN | RCC_APB2ENR_AFIOEN;
+  RCC->AHBENR |= RCC_AHBENR_DMA1EN;
 
   // ---- PA4(CS) - 浮空输入 (硬件 NSS) / floating input (HW NSS) ----
   GPIOA->CRL &= ~(0xF << (4 * 4));
@@ -133,27 +116,31 @@ static void spi_slave_init(void) {
   GPIOA->CRL &= ~(0xF << (7 * 4));
   GPIOA->CRL |=  (0x4 << (7 * 4));
 
-  // ---- SPI1: 从机, 模式1, 硬件 NSS / slave, mode1, hardware NSS ----
-  //  硬件 NSS 零延迟选中, spi_rx_index 在 SPI1 ISR 首字节时复位
+  // ---- DMA1 通道2: SPI1_RX (只设常量, CNDTR/EN 在 CS↓ 中设) ----
+  // DMA1 Channel 2: SPI1_RX (constants only; CNDTR/EN set in CS↓)
+  DMA1_Channel2->CCR = 0;
+  DMA1_Channel2->CPAR = (uint32_t)&SPI1->DR;
+  DMA1_Channel2->CMAR = (uint32_t)spi_buffer;
+  DMA1_Channel2->CNDTR = 0;
+  (void)DMA1_Channel2->CCR;                // 回读确认 / read-back confirmation
+
+  // ---- SPI1: 从机, 模式1, 硬件 NSS + DMA RX 请求 ----
+  //  Slave, mode1, HW NSS + DMA RX request
   SPI1->CR1 = 0;
-  SPI1->CR1 = SPI_CR1_CPHA;           // 模式1, MSTR=0(从机), SSM=0(硬件NSS)
-  SPI1->CR1 &= ~SPI_CR1_LSBFIRST;     // MSB 先行
-  SPI1->CR2 = 0;                      // RXNEIE 由 CS 中断控制
-  SPI1->CR1 |= SPI_CR1_SPE;           // 使能 SPI
+  SPI1->CR1 = SPI_CR1_CPHA;                // 模式1, MSTR=0(从机), SSM=0(硬件NSS)
+  SPI1->CR1 &= ~SPI_CR1_LSBFIRST;          // MSB 先行 / MSB first
+  SPI1->CR2 = SPI_CR2_RXDMAEN;             // DMA RX 请求使能 / DMA RX request enable
+  SPI1->CR1 |= SPI_CR1_SPE;                // 使能 SPI / enable SPI
 
   // ---- NVIC ----
-  //  USB LP 默认优先级 0 > EXTI4(1), 会延迟 CS 中断导致丢前几个字节
-  //  USB LP default priority 0 > EXTI4(1), delays CS ISR causing byte loss
   NVIC_SetPriority(USB_LP_CAN1_RX0_IRQn, 3);
-  NVIC_SetPriority(SPI1_IRQn, 2);
-  NVIC_EnableIRQ(SPI1_IRQn);
   NVIC_SetPriority(EXTI4_IRQn, 1);
 
   // ---- EXTI ----
   pinMode(PIN_SPI_CS, INPUT_PULLUP);
   attachInterrupt(digitalPinToInterrupt(PIN_SPI_CS), cs_interrupt_handler, CHANGE);
 
-  SerialUSB.printf("[SPI] 从机就绪 | 模式1 | PA4(CS) attachInterrupt | 中断逐字节接收");
+  SerialUSB.printf("[SPI] DMA 就绪 | 模式1 | HW NSS | DMA1_CH2");
   SerialUSB.println();
 }
 
@@ -261,7 +248,6 @@ void loop(void) {
           last_summary = now;
         }
       } else {
-        // 打印非标准帧, 调试用 / print non-standard frame for debug
         SerialUSB.printf("[SPI] !!! #%u | %u B (非标准)\n",
                         packet_count, rx_len);
       }
