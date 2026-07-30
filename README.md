@@ -1,4 +1,4 @@
-# FTDX10 转接板 — 数据帧协议
+# FTDX10 ACC接口 转接板 — 数据帧协议
 
 English Ver:https://github.com/SLTPLAN/FTDX10_WF_HUB/blob/main/README_EN.md
 
