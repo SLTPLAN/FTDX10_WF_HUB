@@ -13,3 +13,6 @@ PA7 (MOSI)	→	Pin4
 GND	—	GND
 
 USB	→	PC（PWR+DATA）
+
+更新日志：
+7/30：优化帧读取方式，防止因帧不完整导致的卡顿
