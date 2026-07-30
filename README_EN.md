@@ -1,4 +1,4 @@
-# FTDX10 Adapter — Frame Protocol
+# FTDX10 ACC Port Adapter — Frame Protocol
 
 中文版: https://github.com/SLTPLAN/FTDX10_WF_HUB/blob/main/README.md
 
