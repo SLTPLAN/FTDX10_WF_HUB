@@ -88,4 +88,4 @@ Extract payload, compute XOR checksum
 
 ## Implementations
 
-STM32F103C8T6
+Check in the corresponding folder.
