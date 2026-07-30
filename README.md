@@ -1,8 +1,12 @@
 # FTDX10 转接板 — 数据帧协议
 
-English Ver:
+English Ver:https://github.com/SLTPLAN/FTDX10_WF_HUB/blob/main/README_EN.md
 
-这只是个数据格式，通讯协议可以使用USB-CDC、SPI、TCP-IP等，与转接板的功能与性能相关。目前正在STM32F103C8T6与ESP32实现USB-CDC协议传输，可以使用我临时修改编译的wfview实现~
+这只是个数据格式，通讯协议可以使用USB-CDC、SPI、TCP-IP等，与转接板的功能与性能相关。
+
+目前正在STM32F103C8T6与ESP32实现USB-CDC协议传输，可以使用我临时修改编译的wfview实现~
+
+wvfiew下载（支持USB-CDC）：https://tylk.cc/file_download/wfview-release-with-DX10-hub.zip
 
 ---
 
