@@ -89,3 +89,12 @@ Extract payload, compute XOR checksum
 ## Implementations
 
 Check in the corresponding folder.
+
+---
+
+## License
+
+Released under the **MIT License** — see [LICENSE](LICENSE).
+The protocol itself (the `alive\0` handshake, SPI mode 1 at 2 MHz, and the
+4096-byte frame layout) is factual information; anyone may reimplement it
+without permission.
